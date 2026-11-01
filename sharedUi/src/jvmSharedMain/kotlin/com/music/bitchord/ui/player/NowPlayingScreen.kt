@@ -1377,8 +1377,12 @@ fun NowPlayingScreen(
     }
     val clipFullscreen = spotifyCanvasOnPhone &&
         heroClipMounted?.source == CanvasSource.SPOTIFY
+    // Contained rather than cropped, whatever the clip's shape: a tall, square or
+    // landscape clip is shown whole at the player's width, top-aligned, so an
+    // animated cover is never zoomed to fill the banner. Only Spotify's
+    // full-screen Canvas is cropped.
     val clipPortrait = !clipFullscreen &&
-        heroClipMounted != null && canvasAspect > 0f && canvasAspect < 1f
+        heroClipMounted != null && canvasAspect > 0f
 
     // The setting defaults on, restoring the five-second stand-down, but the
     // listener can keep the deck open indefinitely from Spotify integration.
@@ -1453,8 +1457,10 @@ fun NowPlayingScreen(
     val clipBottom = canvasBottom(clipPortrait)
     // Match the old hero's fade height in physical pixels, not its much larger
     // percentage of a portrait video. The mask ends at the real video bottom.
+    // Never more than the banner's own share of a clip: a landscape clip is
+    // shorter than the banner, and matching pixels alone would dissolve most of it.
     val clipFadeFraction = if (clipBottom > 0.dp) {
-        (heroHeight.value * HERO_FADE_FRACTION / clipBottom.value).coerceIn(0f, 1f)
+        (heroHeight.value * HERO_FADE_FRACTION / clipBottom.value).coerceIn(0f, HERO_FADE_FRACTION)
     } else 0f
     val statusBarTop = stableStatusBarInsets().asPaddingValues().calculateTopPadding()
     // What sits between the status bar and the artwork: the drag strip. Read
@@ -1776,20 +1782,21 @@ fun NowPlayingScreen(
     // until the clip has painted the same frame again.
     fun stillTakesOver(): Boolean = still() != null && CanvasStills.fresh &&
         (collapseStarted || dockMoving || lyricsOpen || queueOpen || queueDragging || !canvasRendered)
-    // A portrait still is the clip's whole picture, not the banner's square:
+    // A still is the clip's whole picture, not the banner's crop of it:
     // top-aligned across the player's width, as the clip is contained, and as
-    // tall. Read off the still, which is there before a reopened clip knows
+    // tall — whatever its shape, so a square clip's still is not zoomed
+    // either. Read off the still, which is there before a reopened clip knows
     // its own shape.
     fun stillBottomPx(): Float {
         val image = still()?.image ?: return 0f
-        if (!heroMode || image.width >= image.height || playerBounds.width <= 0) return 0f
+        if (!heroMode || image.width <= 0 || image.height <= 0 || playerBounds.width <= 0) return 0f
         return minOf(playerBounds.width * image.height / image.width.toFloat(), playerBounds.height.toFloat())
     }
     // The clip's dissolve, held at the banner's height in pixels — see [clipFadeFraction].
     fun stillFadeFraction(): Float {
         val bottom = stillBottomPx()
         if (bottom <= 0f) return HERO_FADE_FRACTION
-        return (with(density) { heroHeight.toPx() } * HERO_FADE_FRACTION / bottom).coerceIn(0f, 1f)
+        return (with(density) { heroHeight.toPx() } * HERO_FADE_FRACTION / bottom).coerceIn(0f, HERO_FADE_FRACTION)
     }
     // Where a clip starts, read once as it mounts — see each — from its still,
     // so the first frame it paints is the one already on screen.

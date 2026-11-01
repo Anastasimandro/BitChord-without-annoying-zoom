@@ -133,7 +133,7 @@ internal fun AndroidCanvasArtworkPlayer(
     isPlaying: Boolean,
     modifier: Modifier = Modifier,
     contentMode: CanvasContentMode = CanvasContentMode.CROP,
-    /** Align a contained portrait clip to the top; other callers retain centered FIT. */
+    /** Align a contained clip (any shape) to the top; other callers retain centered FIT. */
     alignPortraitTop: Boolean = false,
     /** The decoded video's display aspect, or zero until Media3 knows it. */
     onAspectRatioChanged: (Float) -> Unit = {},
@@ -507,7 +507,7 @@ internal fun AndroidCanvasArtworkPlayer(
                         height: Int,
                     ) {
                         delegate?.onSurfaceTextureSizeChanged(surface, width, height)
-                        if (currentContentMode == CanvasContentMode.FIT_PORTRAIT && clipAspect in 0f..1f) {
+                        if (currentContentMode == CanvasContentMode.FIT_PORTRAIT && clipAspect >= 0f) {
                             rendered = false
                         }
                     }
@@ -544,11 +544,11 @@ internal fun AndroidCanvasArtworkPlayer(
                             val transformed = textureView?.applyContentTransform(
                                 clipAspect, currentContentMode, currentAlignPortraitTop,
                             ) == true
-                            val portrait = currentContentMode == CanvasContentMode.FIT_PORTRAIT &&
-                                clipAspect > 0f && clipAspect < 1f
+                            val contained = currentContentMode == CanvasContentMode.FIT_PORTRAIT &&
+                                clipAspect > 0f
                             val expected = currentPortraitRevealBounds
                             val view = textureView
-                            val layoutReady = !portrait ||
+                            val layoutReady = !contained ||
                                 (expected != IntSize.Zero && view?.width == expected.width &&
                                     view?.height == expected.height)
                             if ((currentContentMode == CanvasContentMode.CROP || transformed) && layoutReady) {
@@ -640,7 +640,7 @@ private fun TextureView.captureAt(
                 (viewHeight * scale).roundToInt().coerceAtLeast(1),
             )
         } ?: return null
-        if (contentMode != CanvasContentMode.FIT_PORTRAIT || clipAspect >= 1f || clipAspect <= 0f) {
+        if (contentMode != CanvasContentMode.FIT_PORTRAIT || clipAspect <= 0f) {
             return frame
         }
 
@@ -682,7 +682,7 @@ private suspend fun TextureView.copyStill(
     if (videoWidth <= 0 || videoHeight <= 0 || width <= 0 || height <= 0) return null
     // No bigger than the view shows it: across its width when contained, and
     // covering it when cropped.
-    val contained = contentMode == CanvasContentMode.FIT_PORTRAIT && clipAspect > 0f && clipAspect < 1f
+    val contained = contentMode == CanvasContentMode.FIT_PORTRAIT && clipAspect > 0f
     val scale = minOf(
         1f,
         if (contained) {
@@ -726,8 +726,10 @@ private const val FRAME_CAPTURE_PX = 128
 
 /**
  * A TextureView stretches its content to its own bounds. Compensate with a
- * transform: cover by default, or contain for a portrait clip when the hero
- * explicitly requests it. An unknown size clears the old transform.
+ * transform: cover by default, or contain when the hero explicitly requests it.
+ * Contain applies to a clip of any shape — portrait, square or landscape — so
+ * the whole frame is shown at its own proportions and nothing is cropped or
+ * zoomed. An unknown size clears the old transform.
  */
 private fun TextureView.applyContentTransform(
     clipAspect: Float,
@@ -741,11 +743,11 @@ private fun TextureView.applyContentTransform(
     }
     val viewAspect = bounds.width.toFloat() / bounds.height
     val pivotX = bounds.width / 2f
-    val pivotY = if (alignPortraitTop && contentMode == CanvasContentMode.FIT_PORTRAIT && clipAspect < 1f) {
+    val pivotY = if (alignPortraitTop && contentMode == CanvasContentMode.FIT_PORTRAIT) {
         0f
     } else bounds.height / 2f
     val matrix = Matrix().apply {
-        val fit = contentMode == CanvasContentMode.FIT_PORTRAIT && clipAspect < 1f
+        val fit = contentMode == CanvasContentMode.FIT_PORTRAIT
         if (fit && clipAspect > viewAspect) {
             setScale(1f, viewAspect / clipAspect, pivotX, pivotY)
         } else if (fit) {
