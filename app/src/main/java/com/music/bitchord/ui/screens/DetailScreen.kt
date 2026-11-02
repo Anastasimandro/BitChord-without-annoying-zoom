@@ -201,6 +201,17 @@ private const val SLEEVE_MAX_HEIGHT = 0.5f
 private val SLEEVE_SHAPE = RoundedCornerShape(12.dp)
 private val SLEEVE_SHADOW = 18.dp
 
+/**
+ * An album's cover — and its animated cover, where Apple has one — runs edge to
+ * edge, up under the top bar, instead of sitting framed in the page. Always on,
+ * for albums, with no setting behind it: the player's own "Full-screen cover
+ * art" switch is separate and leaves the player free to stay square.
+ *
+ * Only in a window this narrow, and upright: wider than that the picture would
+ * be taller than the window, and the framed sleeve is kept.
+ */
+private val RELEASE_FULL_BLEED_MAX_WIDTH = 600.dp
+
 /** Shuffle and Add to Library either side of the release page's Play pill. */
 private val RELEASE_SIDE_BUTTON = 50.dp
 private val RELEASE_ACTION_GAP = 14.dp
@@ -536,6 +547,13 @@ fun DetailScreen(
                 // the narrow one it was written for.
                 val artHeight = (maxWidth / ARTIST_PHOTO_RATIO).coerceAtMost(maxHeight * 0.6f)
                 val sleeveSize = (maxWidth * SLEEVE_FRACTION).coerceAtMost(maxHeight * SLEEVE_MAX_HEIGHT)
+                // An album with a cover runs it edge to edge in a narrow, upright
+                // window — see [RELEASE_FULL_BLEED_MAX_WIDTH]. A page with no
+                // cover keeps the framed placeholder rather than a screen-wide one.
+                val fullBleedRelease = page.type == BrowseType.ALBUM &&
+                    page.thumbnailUrl != null &&
+                    maxWidth <= RELEASE_FULL_BLEED_MAX_WIDTH &&
+                    maxWidth <= maxHeight
                 // A folder's grid view: the same column count the Library's
                 // "Show all" grids reach at this width.
                 val gridColumns = libraryGrid(maxWidth - PAGE_GUTTER * 2).columns
@@ -573,6 +591,7 @@ fun DetailScreen(
                         page = page,
                         palette = palette,
                         sleeveSize = sleeveSize,
+                        fullBleed = fullBleedRelease,
                         canvas = canvas,
                         songs = songs,
                         onPlay = { onSongClick(songs, 0) },
@@ -891,12 +910,19 @@ fun DetailScreen(
  * page, not the page's top edge, so there is nothing to blend into and no
  * layer drawn behind the list. Search, sort and the overflow menu are the top
  * bar's, not this header's.
+ *
+ * With [fullBleed] — an album with a cover, in a narrow upright window — the
+ * sleeve is instead the page's top edge: a square the width of the page, up
+ * under the top bar, its foot dissolved into the page colour. The animated
+ * cover plays inside it at the same size.
  */
 @Composable
 private fun ReleaseHeader(
     page: DetailPage,
     palette: ArtworkPalette,
     sleeveSize: Dp,
+    /** The cover runs edge to edge under the top bar — see [RELEASE_FULL_BLEED_MAX_WIDTH]. */
+    fullBleed: Boolean,
     canvas: CanvasArtwork?,
     songs: List<Song>,
     onPlay: () -> Unit,
@@ -915,16 +941,26 @@ private fun ReleaseHeader(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            // Clear of the floating bar, which the sleeve no longer runs under.
-            .padding(top = topBarContentPadding(), bottom = 18.dp),
+            // Clear of the floating bar, which a framed sleeve does not run
+            // under. A full-bleed cover does: it starts at the top of the page.
+            .padding(top = if (fullBleed) 0.dp else topBarContentPadding(), bottom = 18.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Box(
-            Modifier
-                .size(sleeveSize)
-                .shadow(SLEEVE_SHADOW, SLEEVE_SHAPE)
-                .background(palette.elevated)
-                .thumbnailBorder(SLEEVE_SHAPE),
+            if (fullBleed) {
+                // Exactly as tall as it is wide, so a square cover — and a square
+                // animated cover — fill it with nothing cropped or zoomed.
+                Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(1f)
+                    .background(palette.elevated)
+            } else {
+                Modifier
+                    .size(sleeveSize)
+                    .shadow(SLEEVE_SHADOW, SLEEVE_SHAPE)
+                    .background(palette.elevated)
+                    .thumbnailBorder(SLEEVE_SHAPE)
+            },
         ) {
             // A cover that isn't there, or wouldn't load — a device folder, a
             // playlist with nothing on it yet, files with no picture — gets a
@@ -957,9 +993,29 @@ private fun ReleaseHeader(
                     modifier = Modifier.matchParentSize(),
                 )
             }
+            // A full-bleed cover has no frame to end in, so its foot dissolves into
+            // the page colour. Over the animated cover too, as the artist page's
+            // photo does. Eased rather than run straight, so no line shows at a stop.
+            if (fullBleed) {
+                Box(
+                    Modifier
+                        .matchParentSize()
+                        .background(
+                            Brush.verticalGradient(
+                                0.70f to Color.Transparent,
+                                0.82f to palette.background.copy(alpha = 0.30f),
+                                0.92f to palette.background.copy(alpha = 0.72f),
+                                0.98f to palette.background.copy(alpha = 0.95f),
+                                1.00f to palette.background,
+                            ),
+                        ),
+                )
+            }
         }
 
-        Spacer(Modifier.height(20.dp))
+        // The foot of a full-bleed cover is already the page colour, so the title
+        // sits closer under it than under a framed sleeve.
+        Spacer(Modifier.height(if (fullBleed) 6.dp else 20.dp))
         Text(
             text = page.title,
             style = MaterialTheme.typography.headlineMedium,
