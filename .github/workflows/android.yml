@@ -1,13 +1,32 @@
 name: Android Release APK
 
+# Builds the signed prod release APKs and publishes them as a GitHub release.
+#
+# Signing: with KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS and KEY_PASSWORD
+# set as repository secrets, the real key is used. Without them — a fork has
+# none — a throwaway key is generated for the run, so the build still completes
+# and the APKs still install. Each run then has its own key, so a build cannot
+# be installed over the previous one: uninstall first, or add the secrets once
+# for builds that update in place.
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+# Publishing a release writes a tag and its assets.
+permissions:
+  contents: write
+
+# Queue rather than cancel: a run cut off halfway through publishing would leave
+# a release with some of its files missing.
+concurrency:
+  group: android-release
+  cancel-in-progress: false
+
 jobs:
   build-prod-release:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
     - name: Checkout Repository
@@ -18,39 +37,158 @@ jobs:
       with:
         java-version: '17'
         distribution: 'temurin'
-        cache: gradle
 
-    - name: Setup Secrets (Keystore & local.properties)
+    - uses: gradle/actions/setup-gradle@v4
+
+    # Secrets go through the environment rather than into the script text, so
+    # an empty one is an empty string and not a syntax error.
+    - name: Setup secrets (local.properties & signing key)
+      id: signing
+      env:
+        LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+        LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+        LISTEN_TOGETHER_SERVER: ${{ secrets.LISTEN_TOGETHER_SERVER }}
+        KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
       run: |
-        echo "LASTFM_API_KEY=${{ secrets.LASTFM_API_KEY }}" > local.properties
-        echo "LASTFM_SECRET=${{ secrets.LASTFM_SECRET }}" >> local.properties
-        echo "LISTEN_TOGETHER_SERVER=${{ secrets.LISTEN_TOGETHER_SERVER }}" >> local.properties
+        set -euo pipefail
 
-        echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > bitchord-release.jks
+        {
+          echo "LASTFM_API_KEY=$LASTFM_API_KEY"
+          echo "LASTFM_SECRET=$LASTFM_SECRET"
+          echo "LISTEN_TOGETHER_SERVER=$LISTEN_TOGETHER_SERVER"
+        } > local.properties
+
+        if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] \
+            && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+          echo "$KEYSTORE_BASE64" | base64 -d > bitchord-release.jks
+          # Checked here, where the message can say what is wrong, rather than
+          # in the middle of packaging, where it cannot.
+          if ! keytool -list -keystore bitchord-release.jks \
+              -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null 2>&1; then
+            echo "::error::The KEYSTORE_* secrets do not open a keystore (check the base64, the password and the alias)."
+            exit 1
+          fi
+          store_password=$KEYSTORE_PASSWORD
+          key_alias=$KEY_ALIAS
+          key_password=$KEY_PASSWORD
+          echo "temporary_key=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::No signing secrets set: signing with a throwaway key for this run."
+          store_password=$(openssl rand -hex 16)
+          key_alias=bitchord-ci
+          key_password=$store_password
+          keytool -genkeypair -keystore bitchord-release.jks -storetype PKCS12 \
+            -alias "$key_alias" -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$store_password" -keypass "$key_password" \
+            -dname "CN=BitChord CI, O=BitChord"
+          echo "temporary_key=true" >> "$GITHUB_OUTPUT"
+        fi
+
         {
           echo "storeFile=bitchord-release.jks"
-          echo "storePassword=${{ secrets.KEYSTORE_PASSWORD }}"
-          echo "keyAlias=${{ secrets.KEY_ALIAS }}"
-          echo "keyPassword=${{ secrets.KEY_PASSWORD }}"
+          echo "storePassword=$store_password"
+          echo "keyAlias=$key_alias"
+          echo "keyPassword=$key_password"
         } > keystore.properties
 
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
 
-    - name: Build Signed Prod Release APK
-      run: ./gradlew assembleProdRelease
+    # The phone and the watch only. The TV app has a workflow of its own (tv.yml)
+    # and was never uploaded from here, so building it only added minutes. The
+    # phone's APK bundles the watch's, so the two always share one key.
+    - name: Build Signed Prod Release APKs
+      run: ./gradlew :app:assembleProdRelease :wearos:assembleProdRelease --stacktrace
+
+    # Named the way the in-app updater reads them (AppUpdateChecker.apkAssetUrl):
+    #
+    #     BitChord-v1.9.apk   BitChord-v1.9_arm64-v8a.apk   ...
+    #
+    # It takes the first file starting "BitChord-" with no "_" in its name, so
+    # the watch's APK is "BitChordWear-", which that prefix never matches.
+    - name: Collect APKs
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+
+        version=$(sed -n 's/^extra\["bitchordVersionName"\] = "\(.*\)"$/\1/p' build.gradle.kts)
+        suffix=$(sed -n 's/^extra\["bitchordBetaSuffix"\] = "\(.*\)"$/\1/p' build.gradle.kts)
+        if [ -z "$version" ]; then
+          echo "::error::Could not read bitchordVersionName from build.gradle.kts."
+          exit 1
+        fi
+        if [ -n "$suffix" ]; then version="$version-$suffix"; fi
+        echo "VERSION=$version" >> "$GITHUB_ENV"
+
+        mkdir -p dist
+        for f in app/build/outputs/apk/prod/release/*.apk; do
+          case "$f" in
+            *universal*) name="BitChord-v$version.apk" ;;
+            *)
+              abi=$(basename "$f" .apk | sed -E 's/^app-prod-(.*)-release$/\1/')
+              name="BitChord-v${version}_${abi}.apk"
+              ;;
+          esac
+          cp "$f" "dist/$name"
+        done
+        for f in wearos/build/outputs/apk/prod/release/*.apk; do
+          cp "$f" "dist/BitChordWear-v$version.apk"
+        done
+
+        ls -l dist
+        test -f "dist/BitChord-v$version.apk" || { echo "::error::No universal phone APK was built."; exit 1; }
+        test -f "dist/BitChordWear-v$version.apk" || { echo "::error::No watch APK was built."; exit 1; }
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
       with:
         name: bitchord-prod-release-signed
-        path: app/build/outputs/apk/prod/release/*.apk
+        path: dist/BitChord-*.apk
+        if-no-files-found: error
 
-    # Built by the same assembleProdRelease, with the same key. The watch app
-    # only pairs with a phone app signed by the same key, so a prod watch APK
-    # for these phone builds can only come from here, never a local build.
+    # Built by the same assemble, with the same key. The watch app only pairs
+    # with a phone app signed by the same key, so a prod watch APK for these
+    # phone builds can only come from here, never a local build.
     - name: Upload Wear OS APK Artifact
       uses: actions/upload-artifact@v4
       with:
         name: bitchord-wear-prod-release-signed
-        path: wearos/build/outputs/apk/prod/release/*.apk
+        path: dist/BitChordWear-*.apk
+        if-no-files-found: error
+
+    - name: Publish GitHub release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        TEMPORARY_KEY: ${{ steps.signing.outputs.temporary_key }}
+      run: |
+        set -euo pipefail
+
+        tag="v${VERSION}-build.${GITHUB_RUN_NUMBER}"
+        subject=$(git log -1 --format=%s)
+
+        {
+          echo "$subject"
+          echo
+          echo "Commit \`${GITHUB_SHA:0:7}\`, build ${GITHUB_RUN_NUMBER}."
+          echo
+          echo "- \`BitChord-v${VERSION}.apk\`: phone, installs on any device."
+          echo "- \`BitChord-v${VERSION}_<abi>.apk\`: phone, for one architecture."
+          echo "- \`BitChordWear-v${VERSION}.apk\`: Wear OS watch."
+          if [ "$TEMPORARY_KEY" = "true" ]; then
+            echo
+            echo "Signed with a temporary key made for this build, because the repository has no signing secrets. Uninstall the previous BitChord before installing it, or add the KEYSTORE_* secrets to get builds that update in place."
+          fi
+        } > release-notes.md
+
+        # A re-run of the same run keeps its tag: replace the files, not the release.
+        if gh release view "$tag" > /dev/null 2>&1; then
+          gh release upload "$tag" dist/*.apk --clobber
+        else
+          gh release create "$tag" dist/*.apk \
+            --target "$GITHUB_SHA" \
+            --title "BitChord v${VERSION} (build ${GITHUB_RUN_NUMBER})" \
+            --notes-file release-notes.md
+        fi
